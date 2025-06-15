@@ -23,12 +23,12 @@ struct ShadowAndLightMetalCanvasView: NSViewRepresentable {
         mtkView.device = MTLCreateSystemDefaultDevice()
         mtkView.clearColor = MTLClearColorMake(0, 0, 0, 1)
         
-        let renderer: ShadowAndLightMetalMetalRenderer
+        let renderer: ShadowAndLightMetalRenderer
         switch modelType {
         case .staticDragon:
-            renderer = ShadowAndLightMetalMetalRenderer(mtkView: mtkView)
+            renderer = ShadowAndLightMetalRenderer(mtkView: mtkView)
         case .loadedOBJ(let url):
-            renderer = ShadowAndLightMetalMetalRenderer(mtkView: mtkView, objURL: url)
+            renderer = ShadowAndLightMetalRenderer(mtkView: mtkView, objURL: url)
         }
         mtkView.delegate = renderer
         
@@ -44,6 +44,6 @@ struct ShadowAndLightMetalCanvasView: NSViewRepresentable {
     }
     
     class Coordinator {
-        var renderer: ShadowAndLightMetalMetalRenderer?
+        var renderer: ShadowAndLightMetalRenderer?
     }
 }

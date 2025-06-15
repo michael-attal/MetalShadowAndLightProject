@@ -6,6 +6,7 @@
 //
 
 import MetalKit
+import ModelIO
 
 struct Light {
     var position: SIMD3<Float>
@@ -23,6 +24,7 @@ struct Material {
     var diffuseColor: SIMD3<Float>
     var specularColor: SIMD3<Float>
     var shininess: Float
+    var isGround: Bool = false
 }
 
 struct VertexIn {
@@ -41,7 +43,7 @@ enum ScaleEffect {
     case shrink
 }
 
-final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
+final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
     private var pipelineState: MTLRenderPipelineState?
     private var commandQueue: MTLCommandQueue?
@@ -83,18 +85,37 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
     private var objSubmesh: MTKSubmesh?
 
     private var light = Light(
-        position: SIMD3<Float>(0, 10, 10),
-        direction: SIMD3<Float>(0, 0, -1),
+        position: SIMD3<Float>(0, 10, 30),
+        direction: SIMD3<Float>(0, -1, -1),
         diffuseColor: SIMD3<Float>(1, 1, 1),
         specularColor: SIMD3<Float>(1, 1, 1),
         specularIntensity: 1.0,
-        kc: 1.0,
-        kl: 0.09,
-        kq: 0.032,
+        kc: 1.0, kl: 0.09, kq: 0.032,
         isOmni: false
     )
     private var material = Material(diffuseColor: SIMD3<Float>(1, 1, 1), specularColor: SIMD3<Float>(1, 1, 1), shininess: 64)
     
+    private var shadowPipelineState: MTLRenderPipelineState?
+    private var skyboxPipelineState: MTLRenderPipelineState?
+    
+    private var shadowTexture: MTLTexture?
+    private var skyboxTexture: MTLTexture?
+    
+    private var viewMatrix = matrix_float4x4()
+    private var modelMatrix = matrix_float4x4()
+    private var lightViewProjectionMatrix = matrix_float4x4()
+    
+    // Plane mesh buffers and indices
+    private var planeVertexBuffer: MTLBuffer?
+    private var planeIndexBuffer: MTLBuffer?
+    private var planePositionsBuffer: MTLBuffer?
+    private var planeNormalsBuffer: MTLBuffer?
+    private var planeUVBuffer: MTLBuffer?
+    private var planeIndices: [UInt16] = []
+    
+    private var planeMaterial = Material(diffuseColor: SIMD3<Float>(1, 1, 1), specularColor: SIMD3<Float>(0.1, 0.1, 0.1), shininess: 8, isGround: true)
+    private var planeFillTexture: MTLTexture?
+
     init(mtkView: MTKView, objURL: URL? = nil) {
         guard let device = mtkView.device else {
             fatalError("MTKView has no MTLDevice.")
@@ -112,18 +133,24 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
 
     private func buildResources(mtkView: MTKView) {
         setupMeshData()
+        setupPlaneMesh()
         setupPipeline(mtkView: mtkView)
         setupDepthState()
         setupTexture()
-        setupMatrices()
+        setupFillTexture()
+        setupShadowTexture()
+        setupSkyboxTexture()
+        setupWhiteTextureForPlane()
     }
     
     // MARK: - Mesh Setup
-
+    
     private func setupMeshData() {
         if let objURL = objURL {
+            isObj = true
             setupOBJMesh(useRandomUVs: false) // No texture for the bear model found in internet, so I use random UVs
         } else {
+            isObj = false
             setupDragonMesh()
         }
     }
@@ -330,6 +357,44 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
         )
     }
     
+    private func setupPlaneMesh(width: Float = 50, depth: Float = 50, y: Float = -5.0) {
+        // Four vertices for a simple plane (two triangles)
+        let positions: [SIMD3<Float>] = [
+            SIMD3<Float>(-width / 2, y, -depth / 2),
+            SIMD3<Float>(width / 2, y, -depth / 2),
+            SIMD3<Float>(width / 2, y, depth / 2),
+            SIMD3<Float>(-width / 2, y, depth / 2),
+        ]
+        let normals: [SIMD3<Float>] = [
+            SIMD3<Float>(0, 1, 0),
+            SIMD3<Float>(0, 1, 0),
+            SIMD3<Float>(0, 1, 0),
+            SIMD3<Float>(0, 1, 0),
+        ]
+        let uvs: [SIMD2<Float>] = [
+            SIMD2<Float>(0, 0),
+            SIMD2<Float>(1, 0),
+            SIMD2<Float>(1, 1),
+            SIMD2<Float>(0, 1),
+        ]
+        let indices: [UInt16] = [
+            0, 1, 2,
+            2, 3, 0,
+        ]
+
+        planePositionsBuffer = device.makeBuffer(bytes: positions, length: positions.count * MemoryLayout<SIMD3<Float>>.stride, options: [])
+        planeNormalsBuffer = device.makeBuffer(bytes: normals, length: normals.count * MemoryLayout<SIMD3<Float>>.stride, options: [])
+        planeUVBuffer = device.makeBuffer(bytes: uvs, length: uvs.count * MemoryLayout<SIMD2<Float>>.stride, options: [])
+        planeIndices = indices
+        planeIndexBuffer = device.makeBuffer(bytes: indices, length: indices.count * MemoryLayout<UInt16>.stride, options: [])
+
+        var verts: [VertexIn] = []
+        for i in 0 ..< positions.count {
+            verts.append(VertexIn(position: positions[i], normal: normals[i], uv: uvs[i]))
+        }
+        planeVertexBuffer = device.makeBuffer(bytes: verts, length: verts.count * MemoryLayout<VertexIn>.stride, options: [])
+    }
+    
     // MARK: - Pipeline Setup
 
     private func setupPipeline(mtkView: MTKView) {
@@ -341,12 +406,10 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
             fatalError("Failed to create Metal library.")
         }
         
-        let vertexFunction = library.makeFunction(name: "vs")
-        let fragmentFunction = library.makeFunction(name: "fs")
-        
+        // Main pipeline
         let pipelineDescriptor = MTLRenderPipelineDescriptor()
-        pipelineDescriptor.vertexFunction = vertexFunction
-        pipelineDescriptor.fragmentFunction = fragmentFunction
+        pipelineDescriptor.vertexFunction = library.makeFunction(name: "vs")
+        pipelineDescriptor.fragmentFunction = library.makeFunction(name: "fs")
         pipelineDescriptor.colorAttachments[0].pixelFormat = mtkView.colorPixelFormat
         
         // Not used for the moment, we pass all these 3 attributes via vertex buffers
@@ -373,6 +436,31 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
         } catch {
             fatalError("Could not create pipeline state: \(error)")
         }
+        
+        // Shadow pipeline
+        let shadowDesc = MTLRenderPipelineDescriptor()
+        shadowDesc.vertexDescriptor = isObj ? objMtlVertexDescriptor : vertexDescriptor
+        shadowDesc.vertexFunction = library.makeFunction(name: "shadow_vs")
+        shadowDesc.fragmentFunction = nil
+        shadowDesc.depthAttachmentPixelFormat = .depth32Float
+        do {
+            shadowPipelineState = try device.makeRenderPipelineState(descriptor: shadowDesc)
+        } catch {
+            fatalError("Could not create shadow pipeline state: \(error)")
+        }
+
+        // Skybox pipeline
+        let skyboxDesc = MTLRenderPipelineDescriptor()
+        skyboxDesc.vertexDescriptor = nil
+        skyboxDesc.vertexFunction = library.makeFunction(name: "skybox_vs")
+        skyboxDesc.fragmentFunction = library.makeFunction(name: "skybox_fs")
+        skyboxDesc.colorAttachments[0].pixelFormat = mtkView.colorPixelFormat
+        skyboxDesc.depthAttachmentPixelFormat = .depth32Float
+        do {
+            skyboxPipelineState = try device.makeRenderPipelineState(descriptor: skyboxDesc)
+        } catch {
+            fatalError("Could not create skybox pipeline state: \(error)")
+        }
     }
     
     // MARK: - Depth State Setup
@@ -384,6 +472,38 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
         depthStencilState = device.makeDepthStencilState(descriptor: depthDescriptor)
     }
     
+    private func setupShadowTexture() {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float, width: 1024, height: 1024, mipmapped: false)
+        desc.usage = [.shaderRead, .renderTarget]
+        shadowTexture = device.makeTexture(descriptor: desc)
+    }
+
+    private func setupSkyboxTexture() {
+        let names = ["pisa_posx", "pisa_negx", "pisa_posy", "pisa_negy", "pisa_posz", "pisa_negz"]
+
+        guard let mdlTexture = MDLTexture(cubeWithImagesNamed: names, bundle: Bundle.main) else {
+            print("Error: Impossible to load the MDLTEXTURE for the SkyBox.")
+            skyboxTexture = nil
+            return
+        }
+
+        let textureLoader = MTKTextureLoader(device: device)
+
+        do {
+            skyboxTexture = try textureLoader.newTexture(texture: mdlTexture, options: [
+                .origin: MTKTextureLoader.Origin.topLeft,
+                .SRGB: false,
+            ])
+        } catch {
+            print("Error when loading the cubemap: \(error)")
+            skyboxTexture = nil
+        }
+    }
+
+    private func setupFillTexture() {
+        fillTexture = loadPrebuiltTexture(name: isObj ? "monkey_albedo" : "dragon")
+    }
+
     // MARK: - Texture Setup Functions
 
     private func setupTexture() {
@@ -529,6 +649,15 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
             bytesPerRow: textureWidth * 4
         )
         return texture
+    }
+    
+    private func setupWhiteTextureForPlane() {
+        let white: [UInt8] = [255, 255, 255, 255]
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+        desc.usage = [.shaderRead]
+        guard let tex = device.makeTexture(descriptor: desc) else { return }
+        tex.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: white, bytesPerRow: 4)
+        planeFillTexture = tex
     }
     
     // MARK: - Matrix Setup
@@ -682,6 +811,36 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
         }
     }
     
+    // MARK: - Matrix utils for Shadow Mapping
+
+    func lookAt(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> float4x4 {
+        let f = normalize(center - eye)
+        let s = normalize(cross(f, up))
+        let u = cross(s, f)
+        
+        let m = float4x4([
+            SIMD4<Float>(s.x, u.x, -f.x, 0.0),
+            SIMD4<Float>(s.y, u.y, -f.y, 0.0),
+            SIMD4<Float>(s.z, u.z, -f.z, 0.0),
+            SIMD4<Float>(-dot(s, eye), -dot(u, eye), dot(f, eye), 1.0),
+        ])
+        return m.transpose
+    }
+
+    func orthographicProjection(left: Float, right: Float, bottom: Float, top: Float, near: Float, far: Float) -> float4x4 {
+        let rl = right - left
+        let tb = top - bottom
+        let fn = far - near
+        
+        let m = float4x4([
+            SIMD4<Float>(2.0 / rl, 0, 0, 0),
+            SIMD4<Float>(0, 2.0 / tb, 0, 0),
+            SIMD4<Float>(0, 0, -1.0 / fn, 0),
+            SIMD4<Float>(-(right + left) / rl, -(top + bottom) / tb, -near / fn, 1),
+        ])
+        return m
+    }
+    
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         // TODO: Handle view resize here
     }
@@ -691,6 +850,7 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
         guard
             let pipelineState = pipelineState,
             let commandQueue = commandQueue,
+            let commandBuffer = commandQueue.makeCommandBuffer(),
             let passDescriptor = view.currentRenderPassDescriptor,
             let drawable = view.currentDrawable,
             let vertexBuffer = vertexBuffer,
@@ -703,13 +863,49 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
         else {
             return
         }
+        // Update matrices
+        projectionMatrix = getProjectionMatrix()
+        translationMatrix = getNewTranslationMatrix(isInitialState: true) // Set isInitialState to false to see ping pong effect
+        rotationMatrix = getNewRotationMatrix(isInitialState: false, for: CACurrentMediaTime()) // Set isInitialState to false to see rotation effect
+
+        scaleMatrix = getNewScaleMatrix(isInitialState: true) // Set isInitialState to false to see grow/shrink effect
+        finalMatrix = projectionMatrix * translationMatrix * rotationMatrix * scaleMatrix // TRS
         
-        // 1. Command buffer creation
-        let commandBuffer = commandQueue.makeCommandBuffer()!
+        // Calculate the view/projection matrix for light
+        let centerOfScene = SIMD3<Float>(0, 0, 0)
+        light.direction = normalize(centerOfScene - light.position)
+        let up = SIMD3<Float>(0, 1, 0)
+        let eye = light.position
+        let lightView = lookAt(eye: eye, center: centerOfScene, up: up)
+        let range: Float = 100
+        let lightProj = orthographicProjection(left: -range, right: range, bottom: -range, top: range, near: 0.1, far: 1000.0)
+        lightViewProjectionMatrix = lightProj * lightView
         
-        // 2. Render command encoder creation
+        // Shadow pass
+        let shadowPassDesc = MTLRenderPassDescriptor()
+        shadowPassDesc.depthAttachment.texture = shadowTexture
+        shadowPassDesc.depthAttachment.loadAction = .clear
+        shadowPassDesc.depthAttachment.storeAction = .store
+        shadowPassDesc.depthAttachment.clearDepth = 1.0
+        
+        let shadowEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: shadowPassDesc)!
+        var shadowTranslationMatrix = translationMatrix
+        var shadowRotationMatrix = rotationMatrix
+        var shadowScaleMatrix = scaleMatrix
+        shadowEncoder.setRenderPipelineState(shadowPipelineState!)
+        shadowEncoder.setDepthStencilState(depthStencilState)
+        shadowEncoder.setViewport(MTLViewport(originX: 0, originY: 0, width: 1024, height: 1024, znear: 0, zfar: 1))
+        shadowEncoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+        shadowEncoder.setVertexBuffer(positionsBuffer, offset: 0, index: 1)
+        shadowEncoder.setVertexBytes(&shadowTranslationMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 2)
+        shadowEncoder.setVertexBytes(&shadowRotationMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 3)
+        shadowEncoder.setVertexBytes(&shadowScaleMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 4)
+        shadowEncoder.setVertexBytes(&lightViewProjectionMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 5)
+        shadowEncoder.drawIndexedPrimitives(type: .triangle, indexCount: indices.count, indexType: isObj ? objSubmesh!.indexType : .uint16, indexBuffer: indexBuffer, indexBufferOffset: 0)
+        shadowEncoder.endEncoding()
+        
+        // Main render pass
         let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor)!
-        
         encoder.setRenderPipelineState(pipelineState)
         encoder.setDepthStencilState(depthStencilState)
         
@@ -722,20 +918,13 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
         // Uncomment to optimize by not drawing hidden faces when not rotating
         // encoder.setCullMode(.front)
         
-        // Update matrices
-        projectionMatrix = getProjectionMatrix()
-        translationMatrix = getNewTranslationMatrix(isInitialState: true) // Set isInitialState to false to see ping pong effect
-        rotationMatrix = getNewRotationMatrix(isInitialState: false, for: CACurrentMediaTime()) // Set isInitialState to false to see rotation effect
-
-        scaleMatrix = getNewScaleMatrix(isInitialState: true) // Set isInitialState to false to see grow/shrink effect
-        finalMatrix = projectionMatrix * translationMatrix * rotationMatrix * scaleMatrix // TRS
-        
         // Send the transformations matrix directly to the GPU without creating a persistent buffer (efficient for small, frequently updated data) with setVertexBytes
         encoder.setVertexBytes(&translationMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 4)
         encoder.setVertexBytes(&rotationMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 5)
         encoder.setVertexBytes(&scaleMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 6)
         encoder.setVertexBytes(&finalMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 7)
-        
+        encoder.setVertexBytes(&lightViewProjectionMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 8)
+
         if let texture = fillTexture {
             encoder.setFragmentTexture(texture, index: 0)
         }
@@ -770,7 +959,15 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
         
         encoder.setFragmentBytes(&light, length: MemoryLayout<Light>.stride, index: 6)
         encoder.setFragmentBytes(&material, length: MemoryLayout<Material>.stride, index: 7)
-
+        
+        if let shadowTexture = shadowTexture {
+            encoder.setFragmentTexture(shadowTexture, index: 8)
+        }
+        
+        if let skyboxTexture = skyboxTexture {
+            encoder.setFragmentTexture(skyboxTexture, index: 9)
+        }
+        
         encoder.drawIndexedPrimitives(
             type: .triangle,
             indexCount: indices.count,
@@ -778,7 +975,51 @@ final class ShadowAndLightMetalMetalRenderer: NSObject, MTKViewDelegate {
             indexBuffer: indexBuffer,
             indexBufferOffset: 0
         )
-        
+
+        if let planeVertexBuffer = planeVertexBuffer, let planePositionsBuffer = planePositionsBuffer, let planeNormalsBuffer = planeNormalsBuffer, let planeUVBuffer = planeUVBuffer, let planeIndexBuffer = planeIndexBuffer {
+            encoder.setVertexBuffer(planeVertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBuffer(planePositionsBuffer, offset: 0, index: 1)
+            encoder.setVertexBuffer(planeNormalsBuffer, offset: 0, index: 2)
+            encoder.setVertexBuffer(planeUVBuffer, offset: 0, index: 3)
+            // Use identity matrices
+            var planeTranslationMatrix = matrix_identity_float4x4
+            var planeRotationMatrix = matrix_identity_float4x4
+            var planeScaleMatrix = matrix_identity_float4x4
+            var planeFinalMatrix = finalMatrix
+            encoder.setVertexBytes(&planeTranslationMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 4)
+            encoder.setVertexBytes(&planeRotationMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 5)
+            encoder.setVertexBytes(&planeScaleMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 6)
+            encoder.setVertexBytes(&planeFinalMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 7)
+            encoder.setVertexBytes(&lightViewProjectionMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 8)
+            if let planeFillTexture = planeFillTexture {
+                encoder.setFragmentTexture(planeFillTexture, index: 0)
+            }
+            encoder.setFragmentBytes(&useAllTextures, length: MemoryLayout<Bool>.size, index: 5)
+            encoder.setFragmentBytes(&light, length: MemoryLayout<Light>.stride, index: 6)
+            encoder.setFragmentBytes(&planeMaterial, length: MemoryLayout<Material>.stride, index: 7)
+            if let shadowTexture = shadowTexture {
+                encoder.setFragmentTexture(shadowTexture, index: 8)
+            }
+            if let skyboxTexture = skyboxTexture {
+                encoder.setFragmentTexture(skyboxTexture, index: 9)
+            }
+            
+            encoder.drawIndexedPrimitives(type: .triangle, indexCount: planeIndices.count, indexType: .uint16, indexBuffer: planeIndexBuffer, indexBufferOffset: 0)
+        }
+
+        // Skybox pass
+        if let skyboxPipelineState = skyboxPipelineState, let skyboxTexture = skyboxTexture {
+            encoder.setRenderPipelineState(skyboxPipelineState)
+            let skyboxDepthDescriptor = MTLDepthStencilDescriptor()
+            skyboxDepthDescriptor.isDepthWriteEnabled = false
+            skyboxDepthDescriptor.depthCompareFunction = .lessEqual
+            let skyboxDepthState = device.makeDepthStencilState(descriptor: skyboxDepthDescriptor)
+            encoder.setDepthStencilState(skyboxDepthState)
+            encoder.setFragmentTexture(skyboxTexture, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 36)
+            encoder.setDepthStencilState(depthStencilState)
+        }
+
         // 4. End & commit
         encoder.endEncoding()
         commandBuffer.present(drawable)
