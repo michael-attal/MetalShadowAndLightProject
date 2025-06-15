@@ -82,6 +82,24 @@ static float3x3 inverse(float3x3 const m)
     };
 }
 
+inline float PCF3x3(depth2d<float> depthTex,
+                    sampler cmpSampler,
+                    float3 sc)            // sc = UV.xy, depth.z
+{
+    float2 texel = 1.0 / float2(depthTex.get_width(),
+                                depthTex.get_height());
+    float acc = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            float2 offset = float2(x, y) * texel;
+            acc += depthTex.sample_compare(cmpSampler,
+                                           sc.xy + offset,
+                                           sc.z);
+        }
+    }
+    return acc / 9.0;
+}
+
 vertex VertexOut vs(VertexIn inVertex [[stage_in]],
                     uint vertexIndex [[vertex_id]],
                     constant float3 *positions [[buffer(1)]],
@@ -127,8 +145,12 @@ fragment float4 fs(
     texturecube<float> skybox [[texture(9)]])
 {
     constexpr sampler s(address::clamp_to_edge, filter::linear);
-    constexpr sampler shadowSampler(coord::normalized, filter::linear, compare_func::less_equal);
-
+    constexpr sampler shadowSampler(coord::normalized,
+                                    filter::linear,
+                                    address::clamp_to_border,
+                                    compare_func::less_equal,
+                                    border_color::opaque_white);
+    
     float4 fillTextureOrAlbedoTexture = fillTexture.sample(s, outVertex.uv);
     
     float3 P = outVertex.position.xyz / outVertex.position.w;
@@ -150,21 +172,25 @@ fragment float4 fs(
     float3 viewDirection = normalize(-outVertex.worldPosition);
     float3 finalSpecular = getSpecular(normal, L, viewDirection, u_material.shininess) * u_material.specularColor * u_light.specularIntensity;
 
-    float bias = u_material.isGround ? 0.01 : max(0.005 * (1.0 - dot(normal, L)), 0.0005);
-    float shadow = shadowTexture.sample_compare(
-        shadowSampler,
-        outVertex.shadowPosition.xy / outVertex.shadowPosition.w,
-        (outVertex.shadowPosition.z / outVertex.shadowPosition.w) - bias
-    );
-    // Use a bit of ambient so shadowed areas aren't fully black
-    float visibility = 0.2 + 0.8 * shadow;
+    float3 shadowCoord = outVertex.shadowPosition.xyz / outVertex.shadowPosition.w;
+    shadowCoord        = shadowCoord * 0.5 + 0.5;        // NDC -> [0,1]
+    // float bias = max(0.001 * (1.0 - dot(normal, L)), 0.0005);
+    float texelSize = 1.0 / float(shadowTexture.get_width());
+    float bias = max(4.0 * texelSize * (1.0 - dot(normal, L)),
+                     1.5 * texelSize);
+    // float visibility  = shadowTexture.sample_compare(shadowSampler, shadowCoord.xy, shadowCoord.z - bias);
+    float visibility = PCF3x3(shadowTexture, shadowSampler, float3(shadowCoord.xy, shadowCoord.z - bias));
+
+    // Small ambient term to avoid pitch-black
+    visibility = 0.2 + 0.8 * visibility;
     
     float3 color = (finalDiffuse * u_material.diffuseColor + finalSpecular) * attenuation * visibility;
+    if (u_material.isGround == false ) {
+        color = (finalDiffuse * u_material.diffuseColor + finalSpecular) * attenuation; // Comment to see the shadow on other models in the scene (actually, it bug: the shadow is also shown on the model itself)
+    }
     float3 reflectedColor = skybox.sample(s, outVertex.reflectDir).rgb;
     float3 finalColor = mix(color, reflectedColor, 0.3); // Partial specular reflection via Environment Mapping
-    if (u_material.isGround) {
-        finalColor = color;
-    }
+    
     
     return float4(finalColor * fillTextureOrAlbedoTexture.rgb, fillTextureOrAlbedoTexture.a);
 }
@@ -178,6 +204,7 @@ vertex float4 shadow_vs(VertexIn inVertex [[stage_in]],
                         constant float4x4& scaleModelMatrix [[buffer(4)]],
                         constant float4x4& lightViewProjectionMatrix [[buffer(5)]])
 {
+    // return float4(); // Uncomment to show without shadow
     float4x4 modelMatrix = translationModelMatrix * rotationModelMatrix * scaleModelMatrix;
     float4 worldPos = modelMatrix * float4(positions[vertexIndex], 1.0);
     return lightViewProjectionMatrix * worldPos;

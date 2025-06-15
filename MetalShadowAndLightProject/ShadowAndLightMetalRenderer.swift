@@ -357,7 +357,7 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
         )
     }
     
-    private func setupPlaneMesh(width: Float = 50, depth: Float = 50, y: Float = -5.0) {
+    private func setupPlaneMesh(width: Float = 50, depth: Float = 50, y: Float = -3.0) {
         // Four vertices for a simple plane (two triangles)
         let positions: [SIMD3<Float>] = [
             SIMD3<Float>(-width / 2, y, -depth / 2),
@@ -871,15 +871,20 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
         scaleMatrix = getNewScaleMatrix(isInitialState: true) // Set isInitialState to false to see grow/shrink effect
         finalMatrix = projectionMatrix * translationMatrix * rotationMatrix * scaleMatrix // TRS
         
-        // Calculate the view/projection matrix for light
-        let centerOfScene = SIMD3<Float>(0, 0, 0)
-        light.direction = normalize(centerOfScene - light.position)
-        let up = SIMD3<Float>(0, 1, 0)
-        let eye = light.position
-        let lightView = lookAt(eye: eye, center: centerOfScene, up: up)
-        let range: Float = 100
-        let lightProj = orthographicProjection(left: -range, right: range, bottom: -range, top: range, near: 0.1, far: 1000.0)
-        lightViewProjectionMatrix = lightProj * lightView
+        let sceneRadius: Float = 15
+        let sceneHeight: Float = 5
+
+        let left = -sceneRadius
+        let right = sceneRadius
+        let bottom = -sceneRadius
+        let top = sceneRadius
+        let near: Float = 10
+        let far: Float = sceneRadius + sceneHeight + length(light.position)
+
+        let lightProj = orthographicProjection(left: left, right: right,
+                                               bottom: bottom, top: top,
+                                               near: near, far: far)
+        lightViewProjectionMatrix = lightProj
         
         // Shadow pass
         let shadowPassDesc = MTLRenderPassDescriptor()
@@ -892,6 +897,10 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
         var shadowTranslationMatrix = translationMatrix
         var shadowRotationMatrix = rotationMatrix
         var shadowScaleMatrix = scaleMatrix
+        shadowEncoder.setDepthBias(4.0, slopeScale: 4.0, clamp: 0.0)
+        shadowEncoder.setCullMode(.back)
+        // shadowEncoder.setCullMode(.front)
+        shadowEncoder.setFrontFacing(.counterClockwise)
         shadowEncoder.setRenderPipelineState(shadowPipelineState!)
         shadowEncoder.setDepthStencilState(depthStencilState)
         shadowEncoder.setViewport(MTLViewport(originX: 0, originY: 0, width: 1024, height: 1024, znear: 0, zfar: 1))
@@ -985,7 +994,7 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
             var planeTranslationMatrix = matrix_identity_float4x4
             var planeRotationMatrix = matrix_identity_float4x4
             var planeScaleMatrix = matrix_identity_float4x4
-            var planeFinalMatrix = finalMatrix
+            var planeFinalMatrix = projectionMatrix * planeTranslationMatrix * planeRotationMatrix * planeScaleMatrix
             encoder.setVertexBytes(&planeTranslationMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 4)
             encoder.setVertexBytes(&planeRotationMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 5)
             encoder.setVertexBytes(&planeScaleMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 6)
