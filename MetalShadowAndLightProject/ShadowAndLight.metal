@@ -53,6 +53,11 @@ float3 getReflect(float3 incident, float3 normal) {
     return normalize(reflect(-incident, normal)); // Metal’s reflect assumes I = direction from light
 }
 
+float phongSpecular(float3 N, float3 V, float3 L, float shininess) {
+    float3 R = reflect(-L, N);
+    return pow(max(0.0, dot(R, V)), shininess);
+}
+
 float3 getSpecular(float3 normal, float3 directionTowardsLight, float3 viewDirection, float shininess) {
     float3 H = normalize(directionTowardsLight + viewDirection); // Half-vector
     float NdotH = max(dot(normal, H), 0.0);

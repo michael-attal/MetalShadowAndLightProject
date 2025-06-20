@@ -357,7 +357,7 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
         )
     }
     
-    private func setupPlaneMesh(width: Float = 50, depth: Float = 50, y: Float = -3.0) {
+    private func setupPlaneMesh(width: Float = 150, depth: Float = 150, y: Float = -3.0) {
         // Four vertices for a simple plane (two triangles)
         let positions: [SIMD3<Float>] = [
             SIMD3<Float>(-width / 2, y, -depth / 2),
@@ -473,7 +473,7 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
     }
     
     private func setupShadowTexture() {
-        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float, width: 1024, height: 1024, mipmapped: false)
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float, width: 4096, height: 4096, mipmapped: false)
         desc.usage = [.shaderRead, .renderTarget]
         shadowTexture = device.makeTexture(descriptor: desc)
     }
@@ -693,8 +693,8 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
                 rows: [
                     // C0  C1   C2   C3
                     [1.0, 0.0, 0.0, 0],
-                    [0.0, 1.0, 0.0, isObj ? 0.0 : -3.0], // Down the dragon a little bit
-                    [0.0, 0.0, 1.0, isObj ? -5.0 : -30.0], // Since the implementation of the projection matrix, move the dragon a little bit.
+                    [0.0, 1.0, 0.0, isObj ? 1.0 : -3.0], // Down the dragon a little bit
+                    [0.0, 0.0, 1.0, isObj ? -6.0 : -25.0], // Since the implementation of the projection matrix, move the dragon a little bit.
                     [0.0, 0.0, 0.0, 1.0],
                 ]
             )
@@ -710,7 +710,7 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
             // For fun: Switch back to initial state to do a ping pong effect :D
             let tx: Float = direction == .top_right ? prevTx + 0.01 : prevTx - 0.01
             let ty: Float = direction == .top_right ? prevTy + 0.01 : prevTy - 0.01
-            let tz: Float = isObj ? -5.0 : -30.0
+            let tz: Float = isObj ? -6.0 : -25.0
             let translationMatrix = matrix_float4x4.init(
                 rows: [
                     // C0  C1   C2   C3
@@ -832,6 +832,7 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
         let tb = top - bottom
         let fn = far - near
         
+        // row-major
         let m = float4x4([
             SIMD4<Float>(2.0 / rl, 0, 0, 0),
             SIMD4<Float>(0, 2.0 / tb, 0, 0),
@@ -884,7 +885,7 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
         let lightProj = orthographicProjection(left: left, right: right,
                                                bottom: bottom, top: top,
                                                near: near, far: far)
-        lightViewProjectionMatrix = lightProj
+        lightViewProjectionMatrix = lightProj.transpose // switch lightProj from row-major to column-major for metal
         
         // Shadow pass
         let shadowPassDesc = MTLRenderPassDescriptor()
@@ -903,7 +904,7 @@ final class ShadowAndLightMetalRenderer: NSObject, MTKViewDelegate {
         shadowEncoder.setFrontFacing(.counterClockwise)
         shadowEncoder.setRenderPipelineState(shadowPipelineState!)
         shadowEncoder.setDepthStencilState(depthStencilState)
-        shadowEncoder.setViewport(MTLViewport(originX: 0, originY: 0, width: 1024, height: 1024, znear: 0, zfar: 1))
+        shadowEncoder.setViewport(MTLViewport(originX: 0, originY: 0, width: 4096, height: 4096, znear: 0, zfar: 1))
         shadowEncoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
         shadowEncoder.setVertexBuffer(positionsBuffer, offset: 0, index: 1)
         shadowEncoder.setVertexBytes(&shadowTranslationMatrix, length: MemoryLayout<matrix_float4x4>.stride, index: 2)
